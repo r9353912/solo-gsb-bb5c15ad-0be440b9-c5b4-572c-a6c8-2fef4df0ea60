@@ -31,6 +31,13 @@ def client() -> TestClient:
         pass
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _ensure_schema():
+    """Create tables even for tests that do not use the HTTP client."""
+    Base.metadata.create_all(bind=engine)
+    yield
+
+
 @pytest.fixture(autouse=True)
 def _clean_tables():
     """Reset all rows between tests so ids/cluster state is deterministic."""
@@ -38,6 +45,10 @@ def _clean_tables():
 
     yield
     with engine.begin() as conn:
+        conn.execute(text("DELETE FROM geofence_alerts"))
+        conn.execute(text("DELETE FROM geofence_audit_entries"))
+        conn.execute(text("DELETE FROM geofence_devices"))
+        conn.execute(text("DELETE FROM geofences"))
         conn.execute(text("DELETE FROM audit_entries"))
         conn.execute(text("DELETE FROM noise_events"))
         conn.execute(text("DELETE FROM clusters"))

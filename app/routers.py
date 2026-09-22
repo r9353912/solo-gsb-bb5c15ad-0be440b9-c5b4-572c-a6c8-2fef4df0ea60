@@ -3,21 +3,41 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from . import clustering
-from .database import AuditEntry, Cluster, NoiseEvent, get_db
+from . import clustering, geofencing
+from .database import (
+    AuditEntry,
+    Cluster,
+    Geofence,
+    GeofenceAlert,
+    GeofenceAuditEntry,
+    NoiseEvent,
+    get_db,
+)
 from .schemas import (
+    AlertPage,
     AuditOut,
     ClusterDetail,
     ClusterOut,
     EventCreate,
     EventOut,
+    GeoCoordinate,
+    GeofenceAlertOut,
+    GeofenceAuditOut,
+    GeofenceCreate,
+    GeofenceDetail,
+    GeofenceDevicesIn,
+    GeofenceDevicesOut,
+    GeofenceOut,
+    GeofenceUpdate,
     HealthOut,
     IngestResult,
+    PolygonOut,
     RebuildResult,
+    ReplayResult,
 )
 
 router = APIRouter(prefix="/api/v1")
@@ -71,6 +91,9 @@ def _store_event(db: Session, payload: EventCreate) -> tuple[NoiseEvent, list[in
     db.add(event)
     db.flush()
     event, merged_ids = clustering.ingest_event(db, event)
+    # After clustering commits, evaluate the observation against every active
+    # geofence bound to this device; enter/exit alerts are written there.
+    geofencing.evaluate_event(db, event)
     return event, merged_ids
 
 
@@ -292,3 +315,265 @@ def get_cluster(
 def rebuild(db: Session = Depends(get_db)) -> RebuildResult:
     cluster_count, event_count = clustering.rebuild_all(db)
     return RebuildResult(cluster_count=cluster_count, event_count=event_count)
+
+
+# ---------------------------------------------------------------------------
+# Geofences
+# ---------------------------------------------------------------------------
+
+def _polygon_out(fence: Geofence) -> PolygonOut:
+    polygon = geofencing.polygon_from_storage(fence.rings_json)
+    return PolygonOut(
+        outer=[GeoCoordinate(latitude=lat, longitude=lon) for lat, lon in polygon["outer"]],
+        holes=[
+            [GeoCoordinate(latitude=lat, longitude=lon) for lat, lon in hole]
+            for hole in polygon["holes"]
+        ],
+    )
+
+
+def _geofence_out(db: Session, fence: Geofence) -> GeofenceOut:
+    return GeofenceOut(
+        id=fence.id,
+        name=fence.name,
+        description=fence.description,
+        polygon=_polygon_out(fence),
+        boundary_rule=fence.boundary_rule,
+        crosses_antimeridian=fence.crosses_antimeridian,
+        active=fence.active,
+        device_ids=geofencing.list_bound_devices(db, fence.id),
+        created_at=_utc(fence.created_at),
+        updated_at=_utc(fence.updated_at),
+    )
+
+
+def _fence_audit_out(entry: GeofenceAuditEntry) -> GeofenceAuditOut:
+    return GeofenceAuditOut(
+        id=entry.id,
+        geofence_id=entry.geofence_id,
+        seq=entry.seq,
+        action=entry.action,
+        event_id=entry.event_id,
+        alert_id=entry.alert_id,
+        device_id=entry.device_id,
+        detail=entry.detail,
+        created_at=_utc(entry.created_at),
+    )
+
+
+def _get_fence_or_404(db: Session, geofence_id: int, *, include_deleted: bool = False) -> Geofence:
+    fence = db.get(Geofence, geofence_id)
+    if fence is None or (not include_deleted and not fence.active):
+        raise HTTPException(status_code=404, detail=f"geofence {geofence_id} not found")
+    return fence
+
+
+@router.post("/geofences", response_model=GeofenceOut, status_code=201, tags=["geofences"])
+def create_geofence(payload: GeofenceCreate, db: Session = Depends(get_db)) -> GeofenceOut:
+    try:
+        polygon = geofencing.polygon_from_payload(payload.polygon)
+        fence = geofencing.create_fence(
+            db, name=payload.name, description=payload.description, polygon=polygon
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return _geofence_out(db, fence)
+
+
+@router.get("/geofences", response_model=list[GeofenceOut], tags=["geofences"])
+def list_geofences(
+    include_deleted: bool = False,
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+) -> list[GeofenceOut]:
+    stmt = select(Geofence).order_by(Geofence.id)
+    if not include_deleted:
+        stmt = stmt.where(Geofence.active.is_(True))
+    rows = db.scalars(stmt.limit(limit).offset(offset)).all()
+    return [_geofence_out(db, row) for row in rows]
+
+
+@router.get("/geofences/{geofence_id}", response_model=GeofenceDetail, tags=["geofences"])
+def get_geofence(
+    geofence_id: int,
+    include_deleted: bool = Query(default=False, description="include soft-deleted fences"),
+    db: Session = Depends(get_db),
+) -> GeofenceDetail:
+    fence = _get_fence_or_404(db, geofence_id, include_deleted=include_deleted)
+    base = _geofence_out(db, fence)
+    audit_rows = db.scalars(
+        select(GeofenceAuditEntry)
+        .where(GeofenceAuditEntry.geofence_id == fence.id)
+        .order_by(GeofenceAuditEntry.seq)
+    ).all()
+    return GeofenceDetail(
+        **base.model_dump(),
+        audit_chain=[_fence_audit_out(a) for a in audit_rows],
+    )
+
+
+@router.patch("/geofences/{geofence_id}", response_model=GeofenceOut, tags=["geofences"])
+def update_geofence(
+    geofence_id: int, payload: GeofenceUpdate, db: Session = Depends(get_db)
+) -> GeofenceOut:
+    fence = _get_fence_or_404(db, geofence_id)
+    polygon = None
+    if payload.polygon is not None:
+        try:
+            polygon = geofencing.polygon_from_payload(payload.polygon)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+    try:
+        fence = geofencing.update_fence(
+            db,
+            fence,
+            name=payload.name,
+            description=payload.description,
+            polygon=polygon,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return _geofence_out(db, fence)
+
+
+@router.delete("/geofences/{geofence_id}", status_code=204, tags=["geofences"])
+def delete_geofence(geofence_id: int, db: Session = Depends(get_db)) -> Response:
+    fence = _get_fence_or_404(db, geofence_id)
+    geofencing.delete_fence(db, fence)
+    return Response(status_code=204)
+
+
+# -- device bindings ---------------------------------------------------------
+
+@router.get(
+    "/geofences/{geofence_id}/devices",
+    response_model=GeofenceDevicesOut,
+    tags=["geofences"],
+)
+def list_geofence_devices(
+    geofence_id: int, db: Session = Depends(get_db)
+) -> GeofenceDevicesOut:
+    fence = _get_fence_or_404(db, geofence_id)
+    return GeofenceDevicesOut(
+        geofence_id=fence.id, device_ids=geofencing.list_bound_devices(db, fence.id)
+    )
+
+
+@router.put(
+    "/geofences/{geofence_id}/devices",
+    response_model=GeofenceDevicesOut,
+    tags=["geofences"],
+)
+def replace_geofence_devices(
+    geofence_id: int, payload: GeofenceDevicesIn, db: Session = Depends(get_db)
+) -> GeofenceDevicesOut:
+    fence = _get_fence_or_404(db, geofence_id)
+    device_ids = geofencing.set_bindings(db, fence, payload.device_ids)
+    return GeofenceDevicesOut(geofence_id=fence.id, device_ids=device_ids)
+
+
+@router.post(
+    "/geofences/{geofence_id}/devices",
+    response_model=GeofenceDevicesOut,
+    tags=["geofences"],
+)
+def bind_geofence_devices(
+    geofence_id: int, payload: GeofenceDevicesIn, db: Session = Depends(get_db)
+) -> GeofenceDevicesOut:
+    fence = _get_fence_or_404(db, geofence_id)
+    device_ids = geofencing.add_bindings(db, fence, payload.device_ids)
+    return GeofenceDevicesOut(geofence_id=fence.id, device_ids=device_ids)
+
+
+@router.delete(
+    "/geofences/{geofence_id}/devices",
+    response_model=GeofenceDevicesOut,
+    tags=["geofences"],
+)
+def unbind_geofence_devices(
+    geofence_id: int,
+    device_id: list[str] = Query(default=..., alias="device_id"),
+    db: Session = Depends(get_db),
+) -> GeofenceDevicesOut:
+    fence = _get_fence_or_404(db, geofence_id)
+    device_ids = geofencing.remove_bindings(db, fence, device_id)
+    return GeofenceDevicesOut(geofence_id=fence.id, device_ids=device_ids)
+
+
+# -- alerts ------------------------------------------------------------------
+
+def _alert_out(alert: GeofenceAlert) -> GeofenceAlertOut:
+    return GeofenceAlertOut(
+        id=alert.id,
+        geofence_id=alert.geofence_id,
+        geofence_name=alert.geofence_name,
+        device_id=alert.device_id,
+        transition=alert.transition,
+        occurred_at=_utc(alert.occurred_at),
+        latitude=alert.latitude,
+        longitude=alert.longitude,
+        event_id=alert.event_id,
+        boundary_rule=alert.boundary_rule,
+        replayed=alert.replayed,
+        created_at=_utc(alert.created_at),
+    )
+
+
+@router.get("/geofence-alerts", response_model=AlertPage, tags=["geofences"])
+def list_geofence_alerts(
+    geofence_id: int | None = None,
+    device_id: str | None = None,
+    transition: str | None = Query(default=None, pattern="^(enter|exit)$"),
+    occurred_after: str | None = None,
+    occurred_before: str | None = None,
+    cursor: str | None = Query(default=None, description="next_cursor from the previous page"),
+    limit: int = Query(default=100, ge=1, le=1000),
+    db: Session = Depends(get_db),
+) -> AlertPage:
+    if geofence_id is not None and db.get(Geofence, geofence_id) is None:
+        raise HTTPException(status_code=404, detail=f"geofence {geofence_id} not found")
+    t_after = _parse_time("occurred_after", occurred_after)
+    t_before = _parse_time("occurred_before", occurred_before)
+    t_after_naive = t_after.replace(tzinfo=None) if t_after is not None else None
+    t_before_naive = t_before.replace(tzinfo=None) if t_before is not None else None
+    decoded = None
+    if cursor is not None:
+        try:
+            decoded = geofencing.decode_cursor(cursor)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+
+    rows = geofencing.query_alerts(
+        db,
+        geofence_id=geofence_id,
+        device_id=device_id,
+        transition=transition,
+        occurred_after=t_after_naive,
+        occurred_before=t_before_naive,
+        cursor=decoded,
+        limit=limit,
+    )
+    next_cursor = None
+    if len(rows) > limit:
+        last = rows[limit - 1]
+        next_cursor = geofencing.encode_cursor(last.occurred_at, last.id)
+        rows = rows[:limit]
+    return AlertPage(items=[_alert_out(a) for a in rows], next_cursor=next_cursor)
+
+
+# -- replay ------------------------------------------------------------------
+
+@router.post(
+    "/geofences/{geofence_id}/replay",
+    response_model=ReplayResult,
+    tags=["geofences"],
+)
+def replay_geofence(
+    geofence_id: int, db: Session = Depends(get_db)
+) -> ReplayResult:
+    fence = _get_fence_or_404(db, geofence_id)
+    deleted_ids, created = geofencing.replay_fence(db, fence)
+    return ReplayResult(
+        geofence_id=fence.id, deleted_alert_ids=deleted_ids, alerts_created=created
+    )

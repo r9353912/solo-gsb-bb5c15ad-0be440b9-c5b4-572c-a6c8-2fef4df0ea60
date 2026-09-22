@@ -121,3 +121,112 @@ class RebuildResult(BaseModel):
 class HealthOut(BaseModel):
     status: str
     database: str
+
+
+# ---------------------------------------------------------------------------
+# Geofences
+# ---------------------------------------------------------------------------
+
+class GeoCoordinate(BaseModel):
+    latitude: float = Field(ge=-90.0, le=90.0)
+    longitude: float = Field(ge=-180.0, le=180.0)
+
+
+class PolygonIn(BaseModel):
+    # Rings are closed: the last point must equal the first. Rings crossing
+    # the ±180° antimeridian are accepted as-is and handled by unwrapping.
+    outer: list[GeoCoordinate] = Field(min_length=4)
+    holes: list[list[GeoCoordinate]] = Field(default_factory=list)
+
+
+class GeofenceCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    description: str | None = Field(default=None, max_length=4096)
+    polygon: PolygonIn
+
+
+class GeofenceUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=128)
+    description: str | None = Field(default=None, max_length=4096)
+    polygon: PolygonIn | None = None
+
+
+class PolygonOut(BaseModel):
+    outer: list[GeoCoordinate]
+    holes: list[list[GeoCoordinate]]
+
+
+class GeofenceOut(BaseModel):
+    id: int
+    name: str
+    description: str | None
+    polygon: PolygonOut
+    boundary_rule: str
+    crosses_antimeridian: bool
+    active: bool
+    device_ids: list[str]
+    created_at: datetime
+    updated_at: datetime
+
+
+class GeofenceDetail(GeofenceOut):
+    audit_chain: list["GeofenceAuditOut"]
+
+
+class GeofenceDevicesIn(BaseModel):
+    device_ids: list[str] = Field(min_length=1)
+
+    @field_validator("device_ids")
+    @classmethod
+    def _nonempty_ids(cls, v: list[str]) -> list[str]:
+        cleaned = [d.strip() for d in v]
+        if any(not d for d in cleaned) or any(len(d) > 128 for d in cleaned):
+            raise ValueError("device_ids entries must be 1..128 non-empty characters")
+        return cleaned
+
+
+class GeofenceDevicesOut(BaseModel):
+    geofence_id: int
+    device_ids: list[str]
+
+
+class GeofenceAlertOut(BaseModel):
+    id: int
+    geofence_id: int
+    geofence_name: str
+    device_id: str
+    transition: str
+    occurred_at: datetime
+    latitude: float
+    longitude: float
+    event_id: int
+    boundary_rule: str
+    replayed: bool
+    created_at: datetime
+
+
+class AlertPage(BaseModel):
+    items: list[GeofenceAlertOut]
+    next_cursor: str | None
+
+
+class ReplayResult(BaseModel):
+    geofence_id: int
+    deleted_alert_ids: list[int]
+    alerts_created: int
+
+
+class GeofenceAuditOut(BaseModel):
+    id: int
+    geofence_id: int
+    seq: int
+    action: str
+    event_id: int | None
+    alert_id: int | None
+    device_id: str | None
+    detail: str | None
+    created_at: datetime
+
+
+# Resolve the forward reference in GeofenceDetail now that every model exists.
+GeofenceDetail.model_rebuild()
