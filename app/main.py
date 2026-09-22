@@ -32,9 +32,11 @@ app = FastAPI(
         "Ingest timezone-aware noise events from inspection devices and merge "
         "them into clusters by location grid adjacency and time proximity. "
         "Overlapping duplicate observations are resolved by confidence with a "
-        "full per-cluster audit chain."
+        "full per-cluster audit chain. Devices can be bound to geofences "
+        "(lat/lon polygons with optional holes, antimeridian-safe); enter/exit "
+        "state changes are tracked in event-time order and emitted as alerts."
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 app.include_router(api_router)

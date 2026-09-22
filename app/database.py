@@ -23,6 +23,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 from .config import settings
+from .geometry import BOUNDARY_RULE
 
 
 class Base(DeclarativeBase):
@@ -131,6 +132,132 @@ class AuditEntry(Base):
 
     __table_args__ = (
         Index("ix_audit_cluster_seq", "cluster_id", "seq", unique=True),
+    )
+
+
+class Geofence(Base):
+    """A lat/lon polygon (outer ring + optional holes) with bound devices.
+
+    ``sqlite_autoincrement`` keeps fence ids unique forever so the retained
+    audit rows of a deleted fence can never collide with a future fence.
+    """
+
+    __tablename__ = "geofences"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    # GeoJSON-order positions [longitude, latitude]; rings stored unclosed.
+    outer_json: Mapped[str] = mapped_column(Text, nullable=False)
+    holes_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    # Fixed service-wide (see app.geometry); stored per row for auditability.
+    boundary_rule: Mapped[str] = mapped_column(
+        String(64), nullable=False, default=BOUNDARY_RULE
+    )
+    created_at: Mapped[object] = mapped_column(
+        DateTime, nullable=False, server_default=func.current_timestamp()
+    )
+    updated_at: Mapped[object] = mapped_column(
+        DateTime, nullable=False, server_default=func.current_timestamp()
+    )
+
+    __table_args__ = {"sqlite_autoincrement": True}
+
+
+class GeofenceDevice(Base):
+    """Binding between a geofence and a device whose events are evaluated."""
+
+    __tablename__ = "geofence_devices"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    fence_id: Mapped[int] = mapped_column(
+        ForeignKey("geofences.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    device_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[object] = mapped_column(
+        DateTime, nullable=False, server_default=func.current_timestamp()
+    )
+
+    __table_args__ = (
+        Index("ix_geofence_devices_pair", "fence_id", "device_id", unique=True),
+        Index("ix_geofence_devices_device", "device_id"),
+    )
+
+
+class GeofenceState(Base):
+    """Current inside/outside state of one (fence, device) pair."""
+
+    __tablename__ = "geofence_states"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    fence_id: Mapped[int] = mapped_column(
+        ForeignKey("geofences.id", ondelete="CASCADE"), nullable=False
+    )
+    device_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    inside: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    last_event_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_occurred_at: Mapped[object | None] = mapped_column(DateTime, nullable=True)
+    updated_at: Mapped[object] = mapped_column(
+        DateTime, nullable=False, server_default=func.current_timestamp()
+    )
+
+    __table_args__ = (
+        Index("ix_geofence_states_pair", "fence_id", "device_id", unique=True),
+    )
+
+
+class GeofenceAlert(Base):
+    """An enter/exit transition of a device across a geofence boundary.
+
+    Rows are regenerated whenever a (fence, device) timeline is recomputed
+    (out-of-order event arrival, geometry update, replay), so alert ids are
+    not stable across recomputations; ``occurred_at`` + ``event_id`` are.
+    """
+
+    __tablename__ = "geofence_alerts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    fence_id: Mapped[int] = mapped_column(
+        ForeignKey("geofences.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    device_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    event_id: Mapped[int | None] = mapped_column(
+        ForeignKey("noise_events.id", ondelete="SET NULL"), nullable=True
+    )
+    transition: Mapped[str] = mapped_column(String(8), nullable=False)  # enter | exit
+    occurred_at: Mapped[object] = mapped_column(DateTime, nullable=False)
+    created_at: Mapped[object] = mapped_column(
+        DateTime, nullable=False, server_default=func.current_timestamp()
+    )
+
+    __table_args__ = (
+        Index("ix_geofence_alerts_time", "occurred_at", "id"),
+        Index("ix_geofence_alerts_fence_time", "fence_id", "occurred_at"),
+        {"sqlite_autoincrement": True},
+    )
+
+
+class GeofenceAudit(Base):
+    """Append-only geofence lifecycle audit; survives fence deletion.
+
+    ``fence_id`` is intentionally not a foreign key: the trail (including the
+    fixed boundary rule in effect) must remain readable after the fence row
+    itself is gone.
+    """
+
+    __tablename__ = "geofence_audit_entries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    fence_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    device_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[object] = mapped_column(
+        DateTime, nullable=False, server_default=func.current_timestamp()
+    )
+
+    __table_args__ = (
+        Index("ix_geofence_audit_fence_seq", "fence_id", "seq", unique=True),
     )
 
 

@@ -38,6 +38,16 @@ def _clean_tables():
 
     yield
     with engine.begin() as conn:
+        conn.execute(text("DELETE FROM geofence_alerts"))
+        conn.execute(text("DELETE FROM geofence_states"))
+        conn.execute(text("DELETE FROM geofence_devices"))
+        conn.execute(text("DELETE FROM geofence_audit_entries"))
+        conn.execute(text("DELETE FROM geofences"))
         conn.execute(text("DELETE FROM audit_entries"))
         conn.execute(text("DELETE FROM noise_events"))
         conn.execute(text("DELETE FROM clusters"))
+        # Geofence tables use AUTOINCREMENT (audit ids must never be reused);
+        # reset the sequence so tests stay deterministic like the other tables.
+        conn.execute(
+            text("DELETE FROM sqlite_sequence WHERE name IN ('geofences', 'geofence_alerts')")
+        )

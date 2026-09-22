@@ -7,8 +7,9 @@ timezone of every report is explicit.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 
 def _ensure_aware(value: object) -> datetime:
@@ -111,6 +112,8 @@ class IngestResult(BaseModel):
     cluster_id: int
     event_id: int
     merged_cluster_ids: list[int]
+    # Geofence enter/exit alerts triggered by this event (usually empty).
+    geofence_alerts: list["GeofenceAlertOut"] = Field(default_factory=list)
 
 
 class RebuildResult(BaseModel):
@@ -121,3 +124,92 @@ class RebuildResult(BaseModel):
 class HealthOut(BaseModel):
     status: str
     database: str
+
+
+# ---------------------------------------------------------------------------
+# Geofences
+# ---------------------------------------------------------------------------
+
+DeviceId = Annotated[str, StringConstraints(min_length=1, max_length=128)]
+# Polygon positions are [longitude, latitude] pairs (GeoJSON order).
+Position = tuple[float, float]
+
+
+def _check_position(lon: float, lat: float) -> None:
+    if not -180.0 <= lon <= 180.0:
+        raise ValueError(f"longitude {lon} out of range [-180, 180]")
+    if not -90.0 <= lat <= 90.0:
+        raise ValueError(f"latitude {lat} out of range [-90, 90]")
+
+
+class GeofenceCreate(BaseModel):
+    """Outer ring plus optional holes; rings may be closed (first == last)."""
+
+    name: str = Field(min_length=1, max_length=128, examples=["yard-north"])
+    outer: list[Position] = Field(min_length=3)
+    holes: list[list[Position]] = Field(default_factory=list)
+    device_ids: list[DeviceId] = Field(default_factory=list)
+
+    @field_validator("outer")
+    @classmethod
+    def _outer_positions(cls, value: list[Position]) -> list[Position]:
+        for lon, lat in value:
+            _check_position(lon, lat)
+        return value
+
+    @field_validator("holes")
+    @classmethod
+    def _hole_positions(cls, value: list[list[Position]]) -> list[list[Position]]:
+        for ring in value:
+            if len(ring) < 3:
+                raise ValueError("each hole must have at least 3 vertices")
+            for lon, lat in ring:
+                _check_position(lon, lat)
+        return value
+
+
+class GeofenceUpdate(GeofenceCreate):
+    """Full replacement of a geofence (PUT semantics)."""
+
+
+class DeviceBind(BaseModel):
+    device_id: DeviceId
+
+
+class GeofenceOut(BaseModel):
+    id: int
+    name: str
+    outer: list[Position]
+    holes: list[list[Position]]
+    boundary_rule: str
+    device_ids: list[str]
+    alert_count: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class GeofenceAlertOut(BaseModel):
+    id: int
+    fence_id: int
+    fence_name: str | None
+    device_id: str
+    event_id: int | None
+    transition: str  # enter | exit
+    occurred_at: datetime
+    created_at: datetime
+
+
+class GeofenceAuditOut(BaseModel):
+    id: int
+    fence_id: int
+    seq: int
+    action: str
+    device_id: str | None
+    detail: str | None
+    created_at: datetime
+
+
+class ReplayResult(BaseModel):
+    fences_processed: int
+    pairs_evaluated: int
+    alert_count: int
