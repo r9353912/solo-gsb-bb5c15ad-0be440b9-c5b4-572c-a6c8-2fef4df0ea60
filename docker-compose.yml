@@ -1,0 +1,24 @@
+services:
+  api:
+    build: .
+    image: soundscape-merge-api:latest
+    container_name: soundscape-api
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: sqlite:////data/soundscape.db
+      GRID_CELL_METERS: "50"
+      GAP_TOLERANCE_SECONDS: "2"
+      LOG_LEVEL: INFO
+    volumes:
+      - soundscape-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  soundscape-data:

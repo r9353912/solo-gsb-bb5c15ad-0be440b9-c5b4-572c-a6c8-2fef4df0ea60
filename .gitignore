@@ -1,0 +1,18 @@
+# SQLite data
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+
+# Editor
+.idea/
+.vscode/
+.DS_Store
